@@ -18,8 +18,7 @@ use hbb_common::{
     tcp::FramedStream,
     tokio::{
         self,
-        net::{TcpListener, TcpStream},
-        sync::{mpsc, Mutex, Semaphore},
+        sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
         time::{timeout, Duration},
     },
     ResultType,
@@ -111,24 +110,18 @@ struct State {
     devices: HashMap<String, Device>,
     invitations: HashMap<String, Invitation>,
     sessions: HashMap<String, Grant>,
-    attempts: HashMap<IpAddr, (u64, u32)>,
+    attempts: AttemptLimiter,
 }
 impl State {
     fn prune(&mut self, time: u64) {
         self.invitations
             .retain(|_, invitation| invitation.expires_at > time);
         self.sessions.retain(|_, grant| grant.expires_at > time);
-        self.attempts
-            .retain(|_, (start, _)| time.saturating_sub(*start) < 60);
+        self.attempts.prune(time);
     }
     fn allow_attempt(&mut self, ip: IpAddr, time: u64) -> bool {
         self.prune(time);
-        if self.attempts.len() >= MAX_DEVICES && !self.attempts.contains_key(&ip) {
-            return false;
-        }
-        let attempt = self.attempts.entry(ip).or_insert((time, 0));
-        attempt.1 += 1;
-        attempt.1 <= 120
+        self.attempts.allow(ip, time)
     }
     fn valid_invitation(&self, owner: &str, id: &str, uuid: &str, time: u64) -> bool {
         let Some(invitation) = self.invitations.get(id) else {
@@ -146,12 +139,31 @@ impl State {
     }
 }
 
+#[derive(Default)]
+struct AttemptLimiter(HashMap<IpAddr, (u64, u32)>);
+impl AttemptLimiter {
+    fn prune(&mut self, time: u64) {
+        self.0.retain(|_, (start, _)| time.saturating_sub(*start) < 60);
+    }
+    fn allow(&mut self, ip: IpAddr, time: u64) -> bool {
+        self.prune(time);
+        if self.0.len() >= MAX_DEVICES && !self.0.contains_key(&ip) {
+            return false;
+        }
+        let attempt = self.0.entry(ip).or_insert((time, 0));
+        attempt.1 = attempt.1.saturating_add(1);
+        attempt.1 <= 120
+    }
+}
+
 struct ControlServer {
     state: Mutex<State>,
     sk: sign::SecretKey,
     access_key: String,
     relay_server: String,
     lookup: DeviceLookup,
+    handshakes: Arc<Semaphore>,
+    prefaces: Arc<Semaphore>,
 }
 
 fn ticket_key(secret: &str) -> secretbox::Key {
@@ -188,9 +200,7 @@ fn open_ticket(ticket: &str, secret: &str) -> ResultType<Grant> {
     Ok(grant)
 }
 
-pub async fn start_control(
-    bind: Option<IpAddr>,
-    port: u16,
+pub fn init_control(
     sk: sign::SecretKey,
     relay_server: String,
     lookup: DeviceLookup,
@@ -199,37 +209,39 @@ pub async fn start_control(
     if access_key.is_empty() {
         return Ok(());
     }
-    let listener = common::listen_tcp(bind, port).await?;
-    let server = Arc::new(ControlServer {
-        state: Mutex::new(State::default()),
-        sk,
-        access_key,
-        relay_server,
-        lookup,
-    });
     CONTROL
-        .set(server.clone())
-        .map_err(|_| anyhow!("private control already started"))?;
-    let slots = Arc::new(Semaphore::new(128));
-    tokio::spawn(async move {
-        loop {
-            let Ok((socket, addr)) = listener.accept().await else {
-                break;
-            };
-            let Ok(permit) = slots.clone().try_acquire_owned() else {
-                continue;
-            };
-            let server = server.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(err) = server.handle(socket, addr).await {
-                    hbb_common::log::trace!("Private control from {addr} closed: {err}");
-                }
-            });
-        }
-    });
-    hbb_common::log::info!("Protected client control listening on tcp {port}");
+        .set(Arc::new(ControlServer {
+            state: Mutex::new(State::default()),
+            sk,
+            access_key,
+            relay_server,
+            lookup,
+            handshakes: Arc::new(Semaphore::new(128)),
+            prefaces: Arc::new(Semaphore::new(128)),
+        }))
+        .map_err(|_| anyhow!("private control already initialized"))?;
     Ok(())
+}
+
+// Bound the first shared TCP frame before parsing or running cryptography.
+pub fn control_preamble() -> ResultType<OwnedSemaphorePermit> {
+    CONTROL
+        .get()
+        .context("private control is not ready")?
+        .prefaces
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("too many private control preambles"))
+}
+
+// The ordinary hbbs TCP dispatcher has already consumed the exact upgrade frame.
+pub async fn control_connection(stream: FramedStream, addr: SocketAddr) -> ResultType<()> {
+    CONTROL
+        .get()
+        .context("private control is not ready")?
+        .clone()
+        .handle(stream, addr)
+        .await
 }
 
 impl ControlServer {
@@ -264,13 +276,15 @@ impl ControlServer {
         })
     }
 
-    async fn handle(self: Arc<Self>, socket: TcpStream, addr: SocketAddr) -> ResultType<()> {
+    async fn handle(self: Arc<Self>, socket: FramedStream, addr: SocketAddr) -> ResultType<()> {
+        let permit = self.handshakes.clone().try_acquire_owned()
+            .map_err(|_| anyhow!("too many private control handshakes"))?;
         if !self.state.lock().await.allow_attempt(addr.ip(), now()?) {
             bail!("too many private server requests");
         }
         let mut stream = timeout(
             Duration::from_secs(10),
-            access_transport::accept(socket, &self.sk),
+            access_transport::accept_framed(socket, &self.sk),
         )
         .await??;
         let identity = timeout(
@@ -283,6 +297,8 @@ impl ControlServer {
             access_transport::recv_json(&mut stream),
         )
         .await??;
+        // Persistent host control channels do not occupy unauthenticated slots.
+        drop(permit);
         if request["op"] == "register" {
             return self.register(stream, identity).await;
         }
@@ -598,60 +614,65 @@ struct ProtectedRelay {
     secret: String,
     waiting: Mutex<HashMap<String, Waiting>>,
     pump: RelayPump,
+    sk: sign::SecretKey,
+    handshakes: Arc<Semaphore>,
+    prefaces: Arc<Semaphore>,
+    attempts: Mutex<AttemptLimiter>,
 }
 
-pub async fn start_relay(
-    bind: Option<IpAddr>,
-    port: u16,
-    sk: sign::SecretKey,
-    pump: RelayPump,
-) -> ResultType<()> {
+pub fn init_relay(sk: sign::SecretKey, pump: RelayPump) -> ResultType<()> {
     let secret = common::get_arg("access-key");
     if secret.is_empty() {
         return Ok(());
     }
-    let listener: TcpListener = common::listen_tcp(bind, port).await?;
-    let relay = Arc::new(ProtectedRelay {
-        secret,
-        waiting: Mutex::new(HashMap::new()),
-        pump,
-    });
     RELAY
-        .set(relay.clone())
-        .map_err(|_| anyhow!("protected relay already started"))?;
-    let slots = Arc::new(Semaphore::new(128));
-    tokio::spawn(async move {
-        loop {
-            let Ok((socket, addr)) = listener.accept().await else {
-                break;
-            };
-            let Ok(permit) = slots.clone().try_acquire_owned() else {
-                continue;
-            };
-            let relay = relay.clone();
-            let sk = sk.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(err) = relay.own_connection(socket, addr, &sk).await {
-                    hbb_common::log::trace!("Private relay from {addr} closed: {err}");
-                }
-            });
-        }
-    });
-    hbb_common::log::info!("Protected relay tunnel listening on tcp {port}");
+        .set(Arc::new(ProtectedRelay {
+            secret,
+            waiting: Mutex::new(HashMap::new()),
+            pump,
+            sk,
+            handshakes: Arc::new(Semaphore::new(128)),
+            prefaces: Arc::new(Semaphore::new(128)),
+            attempts: Mutex::new(AttemptLimiter::default()),
+        }))
+        .map_err(|_| anyhow!("protected relay already initialized"))?;
     Ok(())
+}
+
+pub fn relay_preamble() -> ResultType<OwnedSemaphorePermit> {
+    RELAY
+        .get()
+        .context("protected relay is not ready")?
+        .prefaces
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("too many protected relay preambles"))
+}
+
+// The ordinary hbbr TCP dispatcher applies BLOCKLIST before this upgrade.
+pub async fn relay_connection(stream: FramedStream, addr: SocketAddr) -> ResultType<()> {
+    RELAY
+        .get()
+        .context("protected relay is not ready")?
+        .clone()
+        .own_connection(stream, addr)
+        .await
 }
 
 impl ProtectedRelay {
     async fn own_connection(
         self: Arc<Self>,
-        socket: TcpStream,
+        socket: FramedStream,
         addr: SocketAddr,
-        sk: &sign::SecretKey,
     ) -> ResultType<()> {
+        let permit = self.handshakes.clone().try_acquire_owned()
+            .map_err(|_| anyhow!("too many protected relay handshakes"))?;
+        if !self.attempts.lock().await.allow(addr.ip(), now()?) {
+            bail!("too many protected relay requests");
+        }
         let mut stream = timeout(
             Duration::from_secs(10),
-            access_transport::accept(socket, sk),
+            access_transport::accept_framed(socket, &self.sk),
         )
         .await??;
         let request: Value = timeout(
@@ -684,6 +705,8 @@ impl ProtectedRelay {
             ticket.as_bytes(),
         )?;
         access_transport::send_json(&mut stream, &json!({"op":"ok"})).await?;
+        // Waiting pairs are bounded separately; active sessions release handshake slots.
+        drop(permit);
         let endpoint = Box::new(OwnedEndpoint(FramedStream::from(stream, addr)));
         self.add(
             grant.uuid.clone(),
@@ -846,6 +869,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_attempts_are_limited_per_address_and_expire() {
+        let ip = "192.0.2.1".parse().unwrap();
+        let other = "192.0.2.2".parse().unwrap();
+        let mut attempts = AttemptLimiter::default();
+        for _ in 0..120 {
+            assert!(attempts.allow(ip, 100));
+        }
+        assert!(!attempts.allow(ip, 100));
+        assert!(attempts.allow(other, 100));
+        assert!(!attempts.allow(ip, 159));
+        assert!(attempts.allow(ip, 160));
+    }
+
+    #[test]
+    fn private_attempts_bound_distinct_addresses_before_authentication() {
+        let mut attempts = AttemptLimiter(
+            (0..MAX_DEVICES as u32)
+                .map(|ip| (IpAddr::V4(std::net::Ipv4Addr::from(ip)), (100, 1)))
+                .collect(),
+        );
+        let extra = "192.0.2.1".parse().unwrap();
+        assert!(!attempts.allow(extra, 100));
+        assert!(attempts.allow("0.0.0.1".parse().unwrap(), 100));
+        assert!(attempts.allow(extra, 160));
+        assert_eq!(attempts.0.len(), 1);
+    }
+
+    #[test]
     fn invitation_validation_requires_live_alias_owner_and_session() {
         let mut state = State::default();
         state.invitations.insert(
@@ -936,6 +987,10 @@ mod tests {
                 secret: "test-secret".into(),
                 waiting: Mutex::new(HashMap::new()),
                 pump,
+                sk: sign::gen_keypair().1,
+                handshakes: Arc::new(Semaphore::new(128)),
+                prefaces: Arc::new(Semaphore::new(128)),
+                attempts: Mutex::new(AttemptLimiter::default()),
             }),
             pairs,
         )
@@ -1130,6 +1185,10 @@ mod tests {
             secret: "test-secret".into(),
             waiting: Mutex::new(HashMap::new()),
             pump,
+            sk: sign::gen_keypair().1,
+            handshakes: Arc::new(Semaphore::new(128)),
+            prefaces: Arc::new(Semaphore::new(128)),
+            attempts: Mutex::new(AttemptLimiter::default()),
         });
         let mut grant = guest_grant();
         grant.expires_at = now().unwrap() + 1;
@@ -1207,6 +1266,8 @@ mod tests {
             access_key: "test-secret".into(),
             relay_server: "rustdesk.example.com:21117".into(),
             lookup,
+            handshakes: Arc::new(Semaphore::new(128)),
+            prefaces: Arc::new(Semaphore::new(128)),
         };
         let (_, reply) = server
             .new_session("P-254785236", None, "127.0.0.1:34567".parse().unwrap())

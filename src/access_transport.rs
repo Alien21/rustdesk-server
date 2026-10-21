@@ -1,6 +1,9 @@
 use hbb_common::{
     anyhow::{anyhow, Context},
     bail,
+    bytes::BytesMut,
+    futures::SinkExt,
+    tcp::{DynTcpStream, FramedStream},
     sodiumoxide::{
         base64,
         crypto::{box_, hash::sha256, secretbox, sign},
@@ -9,13 +12,13 @@ use hbb_common::{
     tokio::{
         self,
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
-        net::TcpStream,
     },
     ResultType,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     io,
+    net::SocketAddr,
     pin::Pin,
     task::{Context as TaskContext, Poll},
 };
@@ -23,6 +26,83 @@ use std::{
 const RECORD_MAX: usize = 64 * 1024;
 const HANDSHAKE_MAX: usize = 4096;
 const DOMAIN: &[u8] = b"rustdesk-access-kx-v1\0";
+
+const UPGRADE: &[u8] = b"\0RustDesk-Private-Access-v1";
+pub const UPGRADE_FRAME: &[u8] = b"\x6c\0RustDesk-Private-Access-v1";
+
+pub fn is_upgrade(bytes: &[u8]) -> bool {
+    bytes == UPGRADE
+}
+
+struct BufferedIo<S> {
+    stream: S,
+    prefix: BytesMut,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for BufferedIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.prefix.is_empty() {
+            let count = out.remaining().min(this.prefix.len());
+            out.put_slice(&this.prefix.split_to(count));
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.stream).poll_read(cx, out)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for BufferedIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
+async fn into_buffered(mut stream: FramedStream) -> ResultType<BufferedIo<DynTcpStream>> {
+    if stream.is_secured() {
+        bail!("private access upgrade must precede legacy encryption");
+    }
+    stream.0.flush().await?;
+    let parts = stream.0.into_parts();
+    Ok(BufferedIo {
+        stream: parts.io,
+        prefix: parts.read_buf,
+    })
+}
+
+// The dispatcher already consumed the upgrade frame; subsequent bytes are raw KX/records.
+pub async fn accept_framed(
+    stream: FramedStream,
+    server_sk: &sign::SecretKey,
+) -> ResultType<AccessStream> {
+    accept(into_buffered(stream).await?, server_sk).await
+}
+
+pub async fn connect_framed(
+    mut stream: FramedStream,
+    server_key: &[u8],
+) -> ResultType<AccessStream> {
+    if stream.is_secured() {
+        bail!("private access upgrade must precede legacy encryption");
+    }
+    stream.send_raw(UPGRADE.to_vec()).await?;
+    connect_raw(into_buffered(stream).await?, server_key).await
+}
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 struct Hello {
@@ -176,10 +256,10 @@ async fn decrypt_records<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
-pub async fn accept(
-    mut stream: TcpStream,
-    server_sk: &sign::SecretKey,
-) -> ResultType<AccessStream> {
+pub async fn accept<S>(mut stream: S, server_sk: &sign::SecretKey) -> ResultType<AccessStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
     let (pk, sk) = box_::gen_keypair();
     let challenge = randombytes::randombytes(32);
     let mut transcript = Vec::from(DOMAIN);
@@ -216,7 +296,15 @@ pub async fn accept(
     ))
 }
 
-pub async fn connect<S>(mut stream: S, server_key: &[u8]) -> ResultType<AccessStream>
+pub async fn connect<S>(stream: S, server_key: &[u8]) -> ResultType<AccessStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    let address = SocketAddr::from(([0, 0, 0, 0], 0));
+    connect_framed(FramedStream::from(stream, address), server_key).await
+}
+
+async fn connect_raw<S>(mut stream: S, server_key: &[u8]) -> ResultType<AccessStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
@@ -292,6 +380,14 @@ impl AsyncWrite for AccessStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hbb_common::{
+        bytes::Bytes,
+        bytes_codec::BytesCodec,
+        protobuf::Message,
+        rendezvous_proto::RendezvousMessage,
+        tokio::net::TcpStream,
+        tokio_util::codec::Encoder,
+    };
 
     #[tokio::test]
     async fn large_bidirectional_stream_delivers_final_reply_before_drop() {
@@ -303,7 +399,9 @@ mod tests {
             let size = RECORD_MAX * 3 + 137;
             let server = tokio::spawn(async move {
                 let (raw, _) = listener.accept().await.unwrap();
-                let mut stream = accept(raw, &server_secret).await.unwrap();
+                let mut framed = FramedStream::from(raw, address);
+                assert!(is_upgrade(&framed.next().await.unwrap().unwrap()));
+                let mut stream = accept_framed(framed, &server_secret).await.unwrap();
                 let request: serde_json::Value = recv_json(&mut stream).await.unwrap();
                 assert_eq!(request["op"], "roundtrip");
                 let (mut reader, mut writer) = tokio::io::split(stream);
@@ -344,7 +442,9 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (raw, _) = listener.accept().await.unwrap();
-                accept(raw, &server_secret).await.is_err()
+                let mut framed = FramedStream::from(raw, address);
+                assert!(is_upgrade(&framed.next().await.unwrap().unwrap()));
+                accept_framed(framed, &server_secret).await.is_err()
             });
             let raw = TcpStream::connect(address).await.unwrap();
             assert!(connect(raw, &wrong_key.0).await.is_err());
@@ -387,4 +487,56 @@ mod tests {
             .is_err());
         assert!(received.is_empty());
     }
+    #[test]
+    fn upgrade_marker_is_exact_and_not_a_legacy_protobuf() {
+        let mut encoded = BytesMut::new();
+        BytesCodec::new().encode(Bytes::copy_from_slice(UPGRADE), &mut encoded).unwrap();
+        assert_eq!(&encoded[..], UPGRADE_FRAME);
+        assert!(is_upgrade(UPGRADE));
+        assert!(!is_upgrade(&UPGRADE[1..]));
+        assert!(!is_upgrade(&[UPGRADE, b"extra"].concat()));
+        assert!(RendezvousMessage::parse_from_bytes(UPGRADE).is_err());
+        let mut legacy = RendezvousMessage::new();
+        legacy.set_register_peer(Default::default());
+        let bytes = legacy.write_to_bytes().unwrap();
+        assert!(!is_upgrade(&bytes));
+        assert!(RendezvousMessage::parse_from_bytes(&bytes).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fragmented_upgrade_preserves_read_ahead_and_pending_framed_writes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut remote, local) = tokio::io::duplex(4096);
+            let address = SocketAddr::from(([127, 0, 0, 1], 1));
+            let mut framed = FramedStream::from(local, address);
+            let mut wire = BytesMut::new();
+            BytesCodec::new()
+                .encode(Bytes::copy_from_slice(UPGRADE), &mut wire)
+                .unwrap();
+            wire.extend_from_slice(b"raw handshake read ahead");
+            let writer = tokio::spawn(async move {
+                remote.write_all(&wire[..2]).await.unwrap();
+                tokio::task::yield_now().await;
+                remote.write_all(&wire[2..]).await.unwrap();
+                remote
+            });
+            assert!(is_upgrade(&framed.next().await.unwrap().unwrap()));
+            let remote = writer.await.unwrap();
+            framed.0.feed(Bytes::from_static(b"queued frame")).await.unwrap();
+            let mut raw = into_buffered(framed).await.unwrap();
+            let mut tail = [0; 24];
+            raw.read_exact(&mut tail).await.unwrap();
+            assert_eq!(&tail, b"raw handshake read ahead");
+            let mut remote = FramedStream::from(remote, address);
+            assert_eq!(&remote.next().await.unwrap().unwrap()[..], b"queued frame");
+            raw.write_all(b"raw write").await.unwrap();
+            let mut remote = into_buffered(remote).await.unwrap();
+            let mut written = [0; 9];
+            remote.read_exact(&mut written).await.unwrap();
+            assert_eq!(&written, b"raw write");
+        })
+        .await
+        .unwrap();
+    }
+
 }

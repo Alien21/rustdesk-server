@@ -90,7 +90,6 @@ pub async fn start_with_bind(
             Some(key) => key,
             None => bail!("Protected relay requires the shared server signing private key"),
         };
-        let access_port = port.checked_add(4).ok_or_else(|| hbb_common::anyhow::anyhow!("Invalid port"))?;
         check_params();
         let protected_limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
         PROTECTED_LIMITER.set(protected_limiter.clone()).map_err(|_| hbb_common::anyhow::anyhow!("Protected relay limiter already configured"))?;
@@ -106,7 +105,8 @@ pub async fn start_with_bind(
                 result
             })
         });
-        crate::server_access::start_relay(bind_addr, access_port, signing_key, pump).await?;
+        crate::server_access::init_relay(signing_key, pump)?;
+        log::info!("Protected relay tunnel shares tcp {port}");
     }
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
@@ -420,8 +420,24 @@ async fn handle_connection(
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
     if !ws && ip.is_loopback() {
+        let protected = crate::server_access::enabled();
+        if protected && BLOCKLIST.read().await.contains(&ip.to_string()) {
+            log::info!("{} blocked", ip);
+            return;
+        }
         let limiter = limiter.clone();
+        let key = key.to_owned();
         tokio::spawn(async move {
+            if protected {
+                match loopback_private_upgrade(&stream).await {
+                    Ok(true) => {
+                        allow_err!(make_pair(stream, addr, &key, limiter, false).await);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(_) => return,
+                }
+            }
             let mut stream = stream;
             let mut buffer = [0; 1024];
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
@@ -443,6 +459,26 @@ async fn handle_connection(
     tokio::spawn(async move {
         allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
     });
+}
+
+// The hbbr console historically shares the loopback relay socket. Peeking the
+// complete framed marker keeps both that console and fragmented local upgrades.
+async fn loopback_private_upgrade(stream: &TcpStream) -> ResultType<bool> {
+    timeout(1_000, async {
+        let expected = crate::access_transport::UPGRADE_FRAME;
+        let mut bytes = vec![0; expected.len()];
+        loop {
+            let count = stream.peek(&mut bytes).await?;
+            if count == 0 || !expected.starts_with(&bytes[..count]) {
+                return Ok(false);
+            }
+            if count == expected.len() {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await?
 }
 
 async fn make_pair(
@@ -481,7 +517,23 @@ async fn make_pair(
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        let mut framed = FramedStream::from(stream, addr);
+        if crate::server_access::enabled() {
+            let preface = crate::server_access::relay_preamble()?;
+            framed.codec_mut().set_max_packet_length(64 * 1024);
+            let bytes = match framed.next_timeout(10_000).await {
+                Some(Ok(bytes)) => bytes,
+                _ => return Ok(()),
+            };
+            drop(preface);
+            if crate::access_transport::is_upgrade(&bytes) {
+                return crate::server_access::relay_connection(framed, addr).await;
+            }
+            framed.codec_mut().set_max_packet_length(usize::MAX);
+            make_protected_public_pair(framed, addr, key, bytes).await;
+        } else {
+            make_pair_(framed, addr, key, limiter).await;
+        }
     }
     Ok(())
 }
@@ -526,6 +578,28 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         PEERS.lock().await.remove(&rf.uuid);
                     }
                 }
+            }
+        }
+    }
+}
+
+
+async fn make_protected_public_pair(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    key: &str,
+    bytes: BytesMut,
+) {
+    if let Ok(msg) = RendezvousMessage::parse_from_bytes(&bytes) {
+        if let Some(rendezvous_message::Union::RequestRelay(request)) = msg.union {
+            if !key.is_empty() && request.licence_key != key {
+                log::trace!("Protected relay authentication failed from {addr}");
+                return;
+            }
+            if let Err(err) = crate::server_access::public_relay(
+                request.uuid, request.id, Box::new(ProtectedPublic(stream, addr)),
+            ).await {
+                log::trace!("Protected public relay from {addr} closed: {err}");
             }
         }
     }
@@ -748,4 +822,43 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+}
+
+#[cfg(test)]
+mod private_dispatch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn loopback_private_marker_survives_fragmented_peeking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let expected = crate::access_transport::UPGRADE_FRAME;
+        let task = tokio::spawn(async move {
+            assert!(loopback_private_upgrade(&server).await.unwrap());
+            let mut received = vec![0; expected.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        });
+        client.write_all(&expected[..1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client.write_all(&expected[1..13]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client.write_all(&expected[13..]).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_console_prefix_is_preserved_when_it_is_not_an_upgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        // The console command and the framed marker both start with byte 0x6c.
+        let command = b"limit-speed 1024";
+        client.write_all(command).await.unwrap();
+        assert!(!loopback_private_upgrade(&server).await.unwrap());
+        let mut received = vec![0; command.len()];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, command);
+    }
 }

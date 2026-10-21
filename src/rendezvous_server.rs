@@ -193,8 +193,8 @@ impl RendezvousServer {
                     }
                 })
             });
-            let access_port = u16::try_from(port.checked_add(4).ok_or_else(|| hbb_common::anyhow::anyhow!("Invalid port"))?)?;
-            crate::server_access::start_control(bind_addr, access_port, signing_key, relay_server, lookup).await?;
+            crate::server_access::init_control(signing_key, relay_server, lookup)?;
+            log::info!("Protected client control shares tcp {port}");
         }
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
@@ -1274,8 +1274,38 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let mut framed = Framed::new(stream, BytesCodec::new());
+            let first = if crate::server_access::enabled() {
+                let preface = crate::server_access::control_preamble()?;
+                framed.codec_mut().set_max_packet_length(64 * 1024);
+                let bytes = match timeout(10_000, framed.next()).await {
+                    Ok(Some(Ok(bytes))) => bytes,
+                    _ => return Ok(()),
+                };
+                drop(preface);
+                if crate::access_transport::is_upgrade(&bytes) {
+                    let parts = framed.into_parts();
+                    let mut framed = Framed::new(
+                        hbb_common::tcp::DynTcpStream(Box::new(parts.io)),
+                        parts.codec,
+                    );
+                    *framed.read_buffer_mut() = parts.read_buf;
+                    *framed.write_buffer_mut() = parts.write_buf;
+                    let upgraded = FramedStream(framed, addr, None, 0);
+                    return crate::server_access::control_connection(upgraded, addr).await;
+                }
+                framed.codec_mut().set_max_packet_length(usize::MAX);
+                Some(bytes)
+            } else {
+                None
+            };
+            let (a, mut b) = framed.split();
             sink = Some(Sink::TcpStream(a));
+            if let Some(bytes) = first {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    return Ok(());
+                }
+            }
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
