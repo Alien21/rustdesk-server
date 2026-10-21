@@ -548,7 +548,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if crate::server_access::enabled() {
-                    if let Err(err) = crate::server_access::public_relay(rf.uuid, rf.id, Box::new(ProtectedPublic(stream, addr))).await {
+                    if let Err(err) = crate::server_access::public_relay(rf.uuid, rf.id, &rf.licence_key, Box::new(ProtectedPublic(stream, addr))).await {
                         log::trace!("Protected public relay from {addr} closed: {err}");
                     }
                     return;
@@ -597,7 +597,7 @@ async fn make_protected_public_pair(
                 return;
             }
             if let Err(err) = crate::server_access::public_relay(
-                request.uuid, request.id, Box::new(ProtectedPublic(stream, addr)),
+                request.uuid, request.id, &request.licence_key, Box::new(ProtectedPublic(stream, addr)),
             ).await {
                 log::trace!("Protected public relay from {addr} closed: {err}");
             }

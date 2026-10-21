@@ -28,7 +28,9 @@ Without `ACCESS_KEY` or `--access-key`, existing behavior and ports remain uncha
 
 The public signing key never grants relay membership. Only a client authenticated with the private access secret can register an owned device or open an owned relay half. Devices also prove possession of their signing keys. Relay tickets bind the session UUID, target identity, device keys, roles, and admission deadline.
 
-Anonymous clients cannot register devices, connect to true device IDs, submit alternate relay requests through hbbs, or pair two public halves on hbbr.
+Unmodified clients may register passive targets through the original registration protocol. A PSK-authenticated controller can connect to those targets. Registration does not authorize an unmodified controller to connect to another unmodified target: hbbr always requires at least one authenticated PSK endpoint and a server-issued grant.
+
+An owned client can enable **Allow clients without the private key to connect to this device**, which is off by default. Only that client's authenticated host registration may set the policy. With it enabled, unmodified controllers with the correct public server Key may connect to that device's real ID. Password, manual approval and existing security settings still apply. With it disabled, public controllers must use a valid invitation; owned PSK controllers keep their normal access. Invitations remain independent of this per-device switch.
 
 The client creates a short alias such as:
 
@@ -42,15 +44,23 @@ The `P-` namespace is reserved for invitations. The server checks generated alia
 
 Validity is 1 to 1440 minutes. Expired or revoked invitations reject new admission. The owner's client validates both the alias and exact issued session UUID immediately before accepting a guest; normal password or manual approval still applies. Established sessions continue after expiration or revocation. Disconnecting or registering a new host-control connection revokes that device's previous invitations and pending grants. Existing relay bridges continue.
 
-## Migration and offline devices
+## Migration and online devices
 
-Before enabling `ACCESS_KEY`, install the modified client on every owned computer, including its local RustDesk service, and enter the same secret in the client's **Private key** field. The public **Key** remains the server signing public key; it does not authenticate membership.
+Update hbbs and hbbr together and preserve the original signing keys and peer database. The owner PCs need the modified client, including its local service, with the same **Private key** secret as `ACCESS_KEY`. The existing unmodified PCs can keep their ID server, relay and public Key settings. Their ID registration and heartbeat remain supported, and online responses combine live legacy peers with live authenticated control channels.
 
-An unmodified client cannot send the private access secret. With protected mode enabled its normal registration and heartbeat are rejected, so its true ID is offline and cannot be an owned connection target. An unmodified guest is supported only as the caller of an active `P-...` invitation. A successful guest invitation does not grant other unmodified computers membership.
+| Controller | Target | Admission |
+| --- | --- | --- |
+| PSK client | Registered legacy client | Allowed with target's normal password/approval |
+| PSK client | PSK client | Allowed with target's normal password/approval |
+| Public client | PSK client real ID | Only while that device allows public connections |
+| Public client | PSK client P invitation | Only with a valid invitation |
+| Public client | Legacy client | Rejected |
 
-For a gradual rollout, update the owned clients before switching on protected mode. Protected mode does not automatically fall back to anonymous registration when a client has no secret.
+The public Key is not a secret. Any stock client can supply it, including through `ID@server?key=...`; the server cannot tell whether it was saved in the client's settings. The public-access switch therefore admits any caller with the correct server Key, subject to the target's password/approval, rather than identifying a list of known PCs. While the switch is enabled, real-ID access does not depend on an invitation's expiry. Leave it off for invitation-only public access.
 
-Online responses for protected mode use the live authenticated host-control registrations, including disconnected channels becoming offline. They do not use stale records from the legacy PeerMap. Online status only reports availability; the same private authentication and invitation rules still govern connections and relay admission.
+Turning the switch off blocks new public admission, including pending requests. Already accepted sessions continue. Re-registering the host closes its previous invitation and pending grants as before. Private ownership is persisted in the existing peer database and cannot be replaced through legacy registration; converting a previously private ID to a legacy target requires deliberate server administration. Known legacy public keys are pinned in protected mode, so replacing a device's key also requires a deliberate reset.
+
+Clipboard server-configuration import/export still transfers only host, relay, API and public Key. It does not export or import the private access secret, invitation settings or public-access policy.
 ## Transport
 
 The private upgrade on the shared TCP ports uses a versioned, server-signed ephemeral X25519 exchange pinned to the public signing key. Directional authenticated encryption keys are derived from the shared key and complete exchange transcript. Encrypted records have monotonically increasing counters and a 64 KiB plaintext limit. Control JSON is also limited to 64 KiB. The access secret is sent only inside this permanent encrypted tunnel.

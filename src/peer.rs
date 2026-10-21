@@ -30,6 +30,8 @@ pub const MAX_PEER_ID_LEN: usize = 253;
 pub(crate) struct PeerInfo {
     #[serde(default)]
     pub(crate) ip: String,
+    #[serde(default)]
+    pub(crate) private_access: bool,
 }
 
 pub(crate) struct Peer {
@@ -66,6 +68,7 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
     pub(crate) db: database::Database,
+    protected_registrations: Arc<Mutex<()>>,
 }
 
 impl PeerMap {
@@ -88,6 +91,7 @@ impl PeerMap {
         let pm = Self {
             map: Default::default(),
             db: database::Database::new(&db).await?,
+            protected_registrations: Default::default(),
         };
         Ok(pm)
     }
@@ -135,6 +139,56 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
+    pub(crate) async fn update_legacy_pk(
+        &mut self,
+        id: String,
+        peer: LockPeer,
+        addr: SocketAddr,
+        uuid: Bytes,
+        pk: Bytes,
+        ip: String,
+    ) -> register_pk_response::Result {
+        let registrations = self.protected_registrations.clone();
+        let _registration = registrations.lock().await;
+        {
+            let existing = peer.read().await;
+            if existing.info.private_access
+                || (!existing.pk.is_empty() && existing.pk != pk)
+                || (!existing.uuid.is_empty() && existing.uuid != uuid)
+            {
+                return register_pk_response::Result::UUID_MISMATCH;
+            }
+        }
+        self.update_pk(id, peer, addr, uuid, pk, ip).await
+    }
+
+    pub(crate) async fn pin_private_key(&self, id: String, key: Vec<u8>) -> ResultType<()> {
+        // Serialize both registration paths through persistence so a legacy write
+        // cannot replace the private ownership marker after enrollment completes.
+        let _registration = self.protected_registrations.lock().await;
+        let peer = self.get_or(&id).await;
+        let (guid, uuid, info) = {
+            let mut value = peer.write().await;
+            if !value.pk.is_empty() && value.pk.as_ref() != key.as_slice() {
+                hbb_common::bail!("device ID already belongs to another key");
+            }
+            value.pk = key.clone().into();
+            value.info.private_access = true;
+            (
+                value.guid.clone(),
+                value.uuid.clone(),
+                serde_json::to_string(&value.info)?,
+            )
+        };
+        if guid.is_empty() {
+            let guid = self.db.insert_peer(&id, &uuid, &key, &info).await?;
+            peer.write().await.guid = guid;
+        } else {
+            self.db.update_pk(&guid, &id, &key, &info).await?;
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
         let p = self.map.read().await.get(id).cloned();
@@ -151,8 +205,7 @@ impl PeerMap {
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
-            self.map.write().await.insert(id.to_owned(), peer.clone());
-            return Some(peer);
+            return Some(self.map.write().await.entry(id.to_owned()).or_insert(peer).clone());
         }
         None
     }
@@ -179,5 +232,68 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+
+    #[tokio::test]
+    async fn private_enrollment_survives_restart_and_concurrent_peer_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("protected-peers.sqlite3");
+        let path = path.to_str().unwrap();
+        let mut peers = PeerMap {
+            map: Default::default(),
+            db: database::Database::new(path).await.unwrap(),
+            protected_registrations: Default::default(),
+        };
+        let id = "723456789";
+        let key = Bytes::from(vec![7; 32]);
+        let uuid = Bytes::from(vec![8; 16]);
+        let addr: SocketAddr = "127.0.0.1:32116".parse().unwrap();
+        let peer = peers.get_or(id).await;
+        assert_eq!(peers.update_legacy_pk(id.into(), peer.clone(), addr,
+            uuid.clone(), key.clone(), "127.0.0.1".into()).await,
+            register_pk_response::Result::OK);
+        peers.pin_private_key(id.into(), key.to_vec()).await.unwrap();
+        assert_eq!(peers.update_legacy_pk(id.into(), peer, addr,
+            uuid.clone(), key.clone(), "127.0.0.2".into()).await,
+            register_pk_response::Result::UUID_MISMATCH);
+        drop(peers);
+
+        let mut reopened = PeerMap {
+            map: Default::default(),
+            db: database::Database::new(path).await.unwrap(),
+            protected_registrations: Default::default(),
+        };
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut loads = Vec::new();
+        for _ in 0..32 {
+            let peers = reopened.clone();
+            let barrier = barrier.clone();
+            loads.push(tokio::spawn(async move {
+                barrier.wait().await;
+                peers.get(id).await.unwrap()
+            }));
+        }
+        let mut canonical: Option<LockPeer> = None;
+        for load in loads {
+            let peer = load.await.unwrap();
+            if let Some(first) = &canonical {
+                assert!(Arc::ptr_eq(first, &peer), "concurrent DB reads replaced the canonical peer");
+            } else {
+                canonical = Some(peer);
+            }
+        }
+        let peer = canonical.unwrap();
+        assert!(Arc::ptr_eq(&peer, &reopened.get(id).await.unwrap()));
+        assert!(peer.read().await.info.private_access);
+        assert_eq!(peer.read().await.pk, key);
+        assert_eq!(reopened.update_legacy_pk(id.into(), peer, addr,
+            uuid, key, "127.0.0.2".into()).await,
+            register_pk_response::Result::UUID_MISMATCH);
     }
 }

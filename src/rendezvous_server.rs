@@ -193,7 +193,53 @@ impl RendezvousServer {
                     }
                 })
             });
-            crate::server_access::init_control(signing_key, relay_server, lookup)?;
+            let legacy_pm = rs.pm.clone();
+            let legacy_lookup: crate::server_access::LegacyLookup = Arc::new(move |id| {
+                let pm = legacy_pm.clone();
+                Box::pin(async move {
+                    let peer = pm.get_in_memory(&id).await?;
+                    let peer = peer.read().await;
+                    if peer.info.private_access
+                        || peer.pk.len() != sign::PUBLICKEYBYTES
+                        || peer.socket_addr.port() == 0
+                        || peer.last_reg_time.elapsed().as_millis() as i64 >= REG_TIMEOUT
+                    {
+                        return None;
+                    }
+                    Some(crate::server_access::LegacyPeer {
+                        id,
+                        key: peer.pk.to_vec(),
+                        addr: peer.socket_addr,
+                    })
+                })
+            });
+            let legacy_tx = rs.tx.clone();
+            let legacy_notify: crate::server_access::LegacyNotify = Arc::new(
+                move |peer, uuid, controller_addr, relay_server| {
+                    let tx = legacy_tx.clone();
+                    Box::pin(async move {
+                        let mut message = RendezvousMessage::new();
+                        message.set_request_relay(RequestRelay {
+                            id: peer.id,
+                            uuid,
+                            socket_addr: AddrMangle::encode(controller_addr).into(),
+                            relay_server,
+                            secure: true,
+                            ..Default::default()
+                        });
+                        tx.send(Data::Msg(message.into(), peer.addr))?;
+                        Ok(())
+                    })
+                },
+            );
+            let private_pm = rs.pm.clone();
+            let enroll: crate::server_access::DeviceEnroll = Arc::new(move |id, key| {
+                let pm = private_pm.clone();
+                Box::pin(async move { pm.pin_private_key(id, key).await })
+            });
+            crate::server_access::init_control(
+                signing_key, relay_server, lookup, legacy_lookup, legacy_notify, enroll,
+            )?;
             log::info!("Protected client control shares tcp {port}");
         }
         let mut listener = create_tcp_listener(bind_addr, port).await?;
@@ -391,10 +437,28 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
-        if crate::server_access::enabled() {
-            return Ok(());
-        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+            let protected = crate::server_access::enabled();
+            if protected {
+                match msg_in.union.as_ref() {
+                    Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                        if rp.id.is_empty() || rp.id.len() > MAX_PEER_ID_LEN || rp.id.starts_with("P-") {
+                            return Ok(());
+                        }
+                        if let Some(peer) = self.pm.get(&rp.id).await {
+                            if peer.read().await.info.private_access {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                        if rk.id.starts_with("P-") || rk.pk.len() != sign::PUBLICKEYBYTES {
+                            return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                        }
+                    }
+                    _ => return Ok(()),
+                }
+            }
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
@@ -426,6 +490,12 @@ impl RendezvousServer {
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
+                        if protected && (peer.info.private_access
+                            || (!peer.pk.is_empty() && peer.pk != rk.pk))
+                        {
+                            drop(peer);
+                            return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                        }
                         if peer.uuid.is_empty() {
                             (true, false)
                         } else {
@@ -488,7 +558,14 @@ impl RendezvousServer {
                         }
                     }
                     if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        if protected {
+                            let result = self.pm.update_legacy_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                            if result != register_pk_response::Result::OK {
+                                return send_rk_res(socket, addr, result).await;
+                            }
+                        } else {
+                            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        }
                     }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -565,7 +642,7 @@ impl RendezvousServer {
                             ..Default::default()
                         });
                     } else {
-                        match crate::server_access::guest_session(&ph.id, addr).await {
+                        match crate::server_access::public_session(&ph.id, addr, &ph.licence_key).await {
                             Ok(relay) => response.set_relay_response(relay),
                             Err(err) => response.set_punch_hole_response(PunchHoleResponse {
                                 other_failure: err.to_string(),
@@ -875,18 +952,19 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
-        if crate::server_access::enabled() {
-            let mut msg_out = RendezvousMessage::new();
-            msg_out.set_online_response(OnlineResponse {
-                states: crate::server_access::online_states(&peers).await?.into(),
-                ..Default::default()
-            });
-            return stream.send(&msg_out).await;
-        }
-        let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
+        let protected = crate::server_access::enabled();
+        let mut states = if protected {
+            crate::server_access::online_states(&peers).await?
+        } else {
+            BytesMut::zeroed((peers.len() + 7) / 8)
+        };
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
+                let peer = peer.read().await;
+                if protected && peer.info.private_access {
+                    continue;
+                }
+                let elapsed = peer.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
