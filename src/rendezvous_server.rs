@@ -875,6 +875,14 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
+        if crate::server_access::enabled() {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_online_response(OnlineResponse {
+                states: crate::server_access::online_states(&peers).await?.into(),
+                ..Default::default()
+            });
+            return stream.send(&msg_out).await;
+        }
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {

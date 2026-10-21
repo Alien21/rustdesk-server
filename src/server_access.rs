@@ -26,7 +26,7 @@ use hbb_common::{
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -113,6 +113,14 @@ struct State {
     attempts: AttemptLimiter,
 }
 impl State {
+    fn online_ids(&self) -> HashSet<String> {
+        self.devices
+            .iter()
+            .filter(|(_, device)| !device.tx.is_closed())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     fn prune(&mut self, time: u64) {
         self.invitations
             .retain(|_, invitation| invitation.expires_at > time);
@@ -221,6 +229,22 @@ pub fn init_control(
         }))
         .map_err(|_| anyhow!("private control already initialized"))?;
     Ok(())
+}
+
+fn pack_online_states(peers: &[String], online: &HashSet<String>) -> BytesMut {
+    let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
+    for (i, id) in peers.iter().enumerate() {
+        if online.contains(id) {
+            states[i / 8] |= 1 << (7 - i % 8);
+        }
+    }
+    states
+}
+
+pub async fn online_states(peers: &[String]) -> ResultType<BytesMut> {
+    let control = CONTROL.get().context("private control is not ready")?;
+    let online = control.state.lock().await.online_ids();
+    Ok(pack_online_states(peers, &online))
 }
 
 // Bound the first shared TCP frame before parsing or running cryptography.
@@ -867,6 +891,58 @@ pub async fn public_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_online_states_preserve_request_order_across_bytes() {
+        let mut state = State::default();
+        let mut receivers = Vec::new();
+        for id in ["alpha", "beta"] {
+            let (tx, rx) = mpsc::channel(1);
+            receivers.push(rx);
+            state.devices.insert(id.into(), Device {
+                identity: Identity {
+                    id: id.into(),
+                    key: Vec::new(),
+                    addr: "127.0.0.1:12345".parse().unwrap(),
+                },
+                tx,
+                generation: String::new(),
+            });
+        }
+        let peers = ["alpha", "unknown", "beta", "alpha", "", "unknown", "beta", "", "beta", "alpha"]
+            .map(str::to_owned);
+        let online = state.online_ids();
+        assert_eq!(&pack_online_states(&peers, &online)[..], &[0xb2, 0xc0]);
+        assert!(pack_online_states(&[], &online).is_empty());
+    }
+
+    #[test]
+    fn private_online_states_exclude_closed_removed_and_invitation_entries() {
+        let mut state = State::default();
+        let (tx, rx) = mpsc::channel(1);
+        state.devices.insert("device".into(), Device {
+            identity: Identity {
+                id: "device".into(),
+                key: Vec::new(),
+                addr: "127.0.0.1:12345".parse().unwrap(),
+            },
+            tx,
+            generation: String::new(),
+        });
+        state.invitations.insert("P-123456789".into(), Invitation {
+            owner: "device".into(),
+            expires_at: u64::MAX,
+        });
+        let peers = ["device", "unknown", "P-123456789"].map(str::to_owned);
+        assert_eq!(&pack_online_states(&peers, &state.online_ids())[..], &[0x80]);
+        drop(rx);
+        assert_eq!(&pack_online_states(&peers, &state.online_ids())[..], &[0]);
+        let (tx, _rx) = mpsc::channel(1);
+        state.devices.get_mut("device").unwrap().tx = tx;
+        assert_eq!(&pack_online_states(&peers, &state.online_ids())[..], &[0x80]);
+        state.devices.remove("device");
+        assert_eq!(&pack_online_states(&peers, &state.online_ids())[..], &[0]);
+    }
 
     #[test]
     fn private_attempts_are_limited_per_address_and_expire() {

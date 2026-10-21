@@ -13,14 +13,14 @@ ACCESS_KEY=your-long-random-secret hbbr
 
 The equivalent option is `--access-key SECRET`. Prefer the environment or a protected configuration file so the secret does not appear in the process command line. Share the signing key file `id_ed25519` between hbbs and hbbr. It stays on the servers; the access secret is a separate value.
 
-Protected mode requires an explicit public relay address in hbbs `--relay-servers`. For a nondefault relay port include that normal public port in the address. The private tunnel is four ports above it.
+Protected mode requires an explicit public relay address in hbbs `--relay-servers`. For a nondefault relay port include that normal public port in the address.
 
-| Process | Default TCP port | Rule |
+| Process | Default TCP port | Use |
 | --- | --- | --- |
-| hbbs private control | 21120 | hbbs port + 4 |
-| hbbr private tunnel | 21121 | hbbr port + 4 |
+| hbbs | 21116 | Private control and normal public guest signaling |
+| hbbr | 21117 | Private tunnel and normal public guest relay |
 
-Make the additional ports reachable by the owner's clients. Existing public hbbs and hbbr TCP/WebSocket ports remain guest entry points. The first version routes protected connections through the relay. Private control and tunnel connections use TCP; a WebSocket-only reverse proxy needs TCP forwarding for these additional ports.
+Private connections use an upgrade preamble on the existing TCP listeners. No additional private ports are opened. Existing WebSocket listeners remain guest entry points; owner control and tunnels require the existing TCP ports. The first version routes protected connections through the relay. The standard online-status query remains on hbbs TCP 21115.
 
 Without `ACCESS_KEY` or `--access-key`, existing behavior and ports remain unchanged.
 
@@ -42,9 +42,18 @@ The `P-` namespace is reserved for invitations. The server checks generated alia
 
 Validity is 1 to 1440 minutes. Expired or revoked invitations reject new admission. The owner's client validates both the alias and exact issued session UUID immediately before accepting a guest; normal password or manual approval still applies. Established sessions continue after expiration or revocation. Disconnecting or registering a new host-control connection revokes that device's previous invitations and pending grants. Existing relay bridges continue.
 
+## Migration and offline devices
+
+Before enabling `ACCESS_KEY`, install the modified client on every owned computer, including its local RustDesk service, and enter the same secret in the client's **Private key** field. The public **Key** remains the server signing public key; it does not authenticate membership.
+
+An unmodified client cannot send the private access secret. With protected mode enabled its normal registration and heartbeat are rejected, so its true ID is offline and cannot be an owned connection target. An unmodified guest is supported only as the caller of an active `P-...` invitation. A successful guest invitation does not grant other unmodified computers membership.
+
+For a gradual rollout, update the owned clients before switching on protected mode. Protected mode does not automatically fall back to anonymous registration when a client has no secret.
+
+Online responses for protected mode use the live authenticated host-control registrations, including disconnected channels becoming offline. They do not use stale records from the legacy PeerMap. Online status only reports availability; the same private authentication and invitation rules still govern connections and relay admission.
 ## Transport
 
-The additional ports use a versioned, server-signed ephemeral X25519 exchange pinned to the public signing key. Directional authenticated encryption keys are derived from the shared key and complete exchange transcript. Encrypted records have monotonically increasing counters and a 64 KiB plaintext limit. Control JSON is also limited to 64 KiB. The access secret is sent only inside this permanent encrypted tunnel.
+The private upgrade on the shared TCP ports uses a versioned, server-signed ephemeral X25519 exchange pinned to the public signing key. Directional authenticated encryption keys are derived from the shared key and complete exchange transcript. Encrypted records have monotonically increasing counters and a 64 KiB plaintext limit. Control JSON is also limited to 64 KiB. The access secret is sent only inside this permanent encrypted tunnel.
 
 Inner RustDesk end-to-end encryption remains required for invitation sessions. Outer transport encryption is never reset after authentication. This protocol does not use TCP half-close; closing either direction closes the tunnel.
 
