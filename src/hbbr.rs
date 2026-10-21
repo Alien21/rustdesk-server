@@ -1,6 +1,8 @@
 use clap::App;
 mod common;
 mod relay_server;
+mod access_transport;
+mod server_access;
 use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
 use relay_server::*;
@@ -16,6 +18,7 @@ fn main() -> ResultType<()> {
         "-b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'
         -p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
         -k, --key=[KEY] 'Only allow the client with the same key'
+        , --access-key=[SECRET] 'Protects relay use; must match hbbs ACCESS_KEY'
         ",
     );
     let matches = App::new("hbbr")
@@ -45,6 +48,9 @@ fn main() -> ResultType<()> {
         .value_of("key")
         .map(str::to_owned)
         .unwrap_or_else(|| common::get_arg("KEY"));
+    if let Some(access_key) = matches.value_of("access-key") {
+        common::set_arg("access-key", access_key);
+    }
     start_with_bind(
         bind_addr,
         matches.value_of("port").unwrap_or(&port.to_string()),

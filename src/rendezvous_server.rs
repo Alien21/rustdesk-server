@@ -174,6 +174,28 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        if crate::server_access::enabled() {
+            let signing_key = match rs.inner.sk.clone() {
+                Some(key) => key,
+                None => bail!("Protected access requires the server signing private key"),
+            };
+            let relay_server = match rs.relay_servers.first() {
+                Some(server) => server.clone(),
+                None => bail!("Protected access requires --relay-servers with the public relay address"),
+            };
+            let pm = rs.pm.clone();
+            let lookup: crate::server_access::DeviceLookup = Arc::new(move |id| {
+                let pm = pm.clone();
+                Box::pin(async move {
+                    match pm.get(&id).await {
+                        Some(peer) => Some(peer.read().await.pk.to_vec()),
+                        None => None,
+                    }
+                })
+            });
+            let access_port = u16::try_from(port.checked_add(4).ok_or_else(|| hbb_common::anyhow::anyhow!("Invalid port"))?)?;
+            crate::server_access::start_control(bind_addr, access_port, signing_key, relay_server, lookup).await?;
+        }
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
@@ -196,7 +218,7 @@ impl RendezvousServer {
                 "N"
             }
         );
-        if test_addr.to_lowercase() != "no" {
+        if test_addr.to_lowercase() != "no" && !crate::server_access::enabled() {
             let test_addr = if test_addr.is_empty() {
                 listener.local_addr()?
             } else {
@@ -369,6 +391,9 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
+        if crate::server_access::enabled() {
+            return Ok(());
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
@@ -529,6 +554,29 @@ impl RendezvousServer {
         ws: bool,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+            if crate::server_access::enabled()
+                && !matches!(msg_in.union.as_ref(), Some(rendezvous_message::Union::TestNatRequest(_)))
+            {
+                if let Some(rendezvous_message::Union::PunchHoleRequest(ph)) = msg_in.union {
+                    let mut response = RendezvousMessage::new();
+                    if !key.is_empty() && ph.licence_key != key {
+                        response.set_punch_hole_response(PunchHoleResponse {
+                            failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                            ..Default::default()
+                        });
+                    } else {
+                        match crate::server_access::guest_session(&ph.id, addr).await {
+                            Ok(relay) => response.set_relay_response(relay),
+                            Err(err) => response.set_punch_hole_response(PunchHoleResponse {
+                                other_failure: err.to_string(),
+                                ..Default::default()
+                            }),
+                        }
+                    }
+                    Self::send_to_sink(sink, response).await;
+                }
+                return false;
+            }
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none

@@ -41,7 +41,8 @@ static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
-static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
+static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
+static PROTECTED_LIMITER: once_cell::sync::OnceCell<Limiter> = once_cell::sync::OnceCell::new(); // in bit/s
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
@@ -83,6 +84,30 @@ pub async fn start_with_bind(
         BLOCKLIST.read().await.len()
     );
     let port: u16 = port.parse()?;
+    if crate::server_access::enabled() {
+        let (_, signing_key) = crate::common::gen_sk(0)?;
+        let signing_key = match signing_key {
+            Some(key) => key,
+            None => bail!("Protected relay requires the shared server signing private key"),
+        };
+        let access_port = port.checked_add(4).ok_or_else(|| hbb_common::anyhow::anyhow!("Invalid port"))?;
+        check_params();
+        let protected_limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+        PROTECTED_LIMITER.set(protected_limiter.clone()).map_err(|_| hbb_common::anyhow::anyhow!("Protected relay limiter already configured"))?;
+        let pump: crate::server_access::RelayPump = std::sync::Arc::new(move |addr, host, peer| {
+            let limiter = protected_limiter.clone();
+            Box::pin(async move {
+                let mut host = ProtectedOwned(host);
+                let mut peer: Box<dyn StreamTrait> = Box::new(ProtectedOwned(peer));
+                let id = format!("{}:{}", addr.ip(), addr.port());
+                USAGE.write().await.insert(id.clone(), Default::default());
+                let result = relay(addr, &mut host, &mut peer, limiter, id.clone()).await;
+                USAGE.write().await.remove(&id);
+                result
+            })
+        });
+        crate::server_access::start_relay(bind_addr, access_port, signing_key, pump).await?;
+    }
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
@@ -340,7 +365,10 @@ async fn io_loop(
     key: &str,
 ) {
     check_params();
-    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+    let limiter = match PROTECTED_LIMITER.get() {
+        Some(limiter) => limiter.clone(),
+        None => <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _),
+    };
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -465,6 +493,12 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
+                    return;
+                }
+                if crate::server_access::enabled() {
+                    if let Err(err) = crate::server_access::public_relay(rf.uuid, rf.id, Box::new(ProtectedPublic(stream, addr))).await {
+                        log::trace!("Protected public relay from {addr} closed: {err}");
+                    }
                     return;
                 }
                 if !rf.uuid.is_empty() {
@@ -628,6 +662,40 @@ trait StreamTrait: Send + Sync + 'static {
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+}
+
+struct ProtectedPublic<S>(S, SocketAddr);
+
+#[async_trait]
+impl<S: StreamTrait> crate::server_access::RelayEndpoint for ProtectedPublic<S> {
+    fn remote_addr(&self) -> SocketAddr { self.1 }
+    async fn receive(&mut self) -> ResultType<Option<BytesMut>> {
+        match self.0.recv().await {
+            Some(result) => Ok(Some(result?)),
+            None => Ok(None),
+        }
+    }
+    async fn transmit(&mut self, bytes: Bytes) -> ResultType<()> {
+        self.0.send_raw(bytes).await
+    }
+}
+
+struct ProtectedOwned(Box<dyn crate::server_access::RelayEndpoint>);
+
+#[async_trait]
+impl StreamTrait for ProtectedOwned {
+    async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
+        match self.0.receive().await {
+            Ok(Some(bytes)) => Some(Ok(bytes)),
+            Ok(None) => None,
+            Err(err) => Some(Err(Error::new(std::io::ErrorKind::Other, err.to_string()))),
+        }
+    }
+    async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()> {
+        self.0.transmit(bytes).await
+    }
+    fn is_ws(&self) -> bool { true }
+    fn set_raw(&mut self) {}
 }
 
 #[async_trait]
