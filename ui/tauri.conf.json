@@ -3,7 +3,7 @@
     "beforeBuildCommand": "npm run build",
     "beforeDevCommand": "npm run dev",
     "devPath": "http://127.0.0.1:5177/",
-    "distDir": "html/dist",
+    "distDir": "../artifacts/ui/dist",
     "withGlobalTauri": true
   },
   "package": {

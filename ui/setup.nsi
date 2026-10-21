@@ -28,7 +28,7 @@ VIAddVersionKey "FileVersion" "${VERSION}"
 # Installer Attributes
 
 Name "${APP_NAME}"
-Outfile "${APP_NAME}.Setup.exe"
+Outfile "..\artifacts\publish\${APP_NAME}.Setup.exe"
 Caption "Setup - ${APP_NAME}"
 BrandingText "${APP_NAME}"
 
@@ -135,7 +135,7 @@ Section "Install"
   Sleep 500
 
   SetOutPath $INSTDIR
-  File /r "setup\*.*"
+  File /r "..\artifacts\staging\server-setup\*.*"
   WriteUninstaller $INSTDIR\uninstall.exe
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"

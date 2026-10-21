@@ -68,16 +68,16 @@ jobs:
           use-cross: true  
 
       - name: Exec chmod
-        run: chmod -v a+x target/${{ matrix.job.target }}/release/*
+        run: chmod -v a+x artifacts/target/${{ matrix.job.target }}/release/*
 
       - name: Publish Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-linux-${{ matrix.job.name }}
           path: |
-            target/${{ matrix.job.target }}/release/hbbr
-            target/${{ matrix.job.target }}/release/hbbs
-            target/${{ matrix.job.target }}/release/rustdesk-utils
+            artifacts/target/${{ matrix.job.target }}/release/hbbr
+            artifacts/target/${{ matrix.job.target }}/release/hbbs
+            artifacts/target/${{ matrix.job.target }}/release/rustdesk-utils
           if-no-files-found: error
 
   build-win:
@@ -128,7 +128,7 @@ jobs:
           certificate: '${{ secrets.WINDOWS_PFX_BASE64 }}'
           password: '${{ secrets.WINDOWS_PFX_PASSWORD }}'
           certificatesha1: '${{ secrets.WINDOWS_PFX_SHA1_THUMBPRINT }}'
-          folder: 'target\x86_64-pc-windows-msvc\release'
+          folder: 'artifacts\target\x86_64-pc-windows-msvc\release'
           recursive: false
 
       - name: Build UI browser file
@@ -141,13 +141,12 @@ jobs:
         run: |
           rustup default nightly
           cargo build --release
-          xcopy /y ..\target\x86_64-pc-windows-msvc\release\*.exe setup\bin\
-          xcopy /y target\release\*.exe setup\
-          mkdir setup\logs
+          New-Item -ItemType Directory -Force -Path ..\artifacts\staging\server-setup\bin, ..\artifacts\staging\server-setup\logs, ..\artifacts\publish | Out-Null
+          Copy-Item -Recurse -Force setup\service ..\artifacts\staging\server-setup\service
+          xcopy /y ..\artifacts\target\x86_64-pc-windows-msvc\release\*.exe ..\artifacts\staging\server-setup\bin\
+          xcopy /y ..\artifacts\target\release\*.exe ..\artifacts\staging\server-setup\
           makensis /V1 setup.nsi
-          mkdir SignOutput
-          mv RustDeskServer.Setup.exe SignOutput\
-          mv ..\target\x86_64-pc-windows-msvc\release\*.exe SignOutput\
+          mv ..\artifacts\target\x86_64-pc-windows-msvc\release\*.exe ..\artifacts\publish\
         working-directory: ./ui
 
       - name: Sign UI setup file 
@@ -157,7 +156,7 @@ jobs:
           certificate: '${{ secrets.WINDOWS_PFX_BASE64 }}'
           password: '${{ secrets.WINDOWS_PFX_PASSWORD }}'
           certificatesha1: '${{ secrets.WINDOWS_PFX_SHA1_THUMBPRINT }}'
-          folder: './ui/SignOutput'
+          folder: './artifacts/publish'
           recursive: false
 
       - name: Publish Artifacts
@@ -165,10 +164,10 @@ jobs:
         with:
           name: binaries-windows-x86_64
           path: |
-            ui\SignOutput\hbbr.exe
-            ui\SignOutput\hbbs.exe
-            ui\SignOutput\rustdesk-utils.exe
-            ui\SignOutput\RustDeskServer.Setup.exe
+            artifacts\publish\hbbr.exe
+            artifacts\publish\hbbs.exe
+            artifacts\publish\rustdesk-utils.exe
+            artifacts\publish\RustDeskServer.Setup.exe
           if-no-files-found: error
 
   # github (draft) release with all binaries
@@ -196,22 +195,22 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: binaries-${{ matrix.job.os }}-${{ matrix.job.name }}
-          path: ${{ matrix.job.name }}
+          path: artifacts/publish/${{ matrix.job.name }}
 
       - name: Exec chmod
-        run: chmod -v a+x ${{ matrix.job.name }}/*
+        run: chmod -v a+x artifacts/publish/${{ matrix.job.name }}/*
 
       - name: Pack files (${{ matrix.job.os }} - ${{ matrix.job.name }})
         run: |
           sudo apt update
           DEBIAN_FRONTEND=noninteractive sudo apt install -y zip
-          zip ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip ${{ matrix.job.name }}/*
+          (cd artifacts/publish && zip ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip ${{ matrix.job.name }}/*)
 
       - name: Create Release (${{ matrix.job.os }} - (${{ matrix.job.name }})
         uses: softprops/action-gh-release@v1
         with:
           draft: true
-          files: ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip
+          files: artifacts/publish/${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip
             
   # docker build and push of single-arch images
   docker:
@@ -576,20 +575,20 @@ jobs:
         run: |
           sudo apt update
           DEBIAN_FRONTEND=noninteractive sudo apt install -y devscripts build-essential debhelper pkg-config ${{ matrix.job.crossbuild_package }}
-          mkdir -p debian-build/${{ matrix.job.name }}/bin
+          mkdir -p artifacts/debian-build/${{ matrix.job.name }}/bin
 
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
           name: binaries-linux-${{ matrix.job.name }}
-          path: debian-build/${{ matrix.job.name }}/bin
+          path: artifacts/debian-build/${{ matrix.job.name }}/bin
 
       - name: Build package for ${{ matrix.job.name }} arch
         run: |
-          chmod -v a+x debian-build/${{ matrix.job.name }}/bin/*
-          cp -vr debian systemd debian-build/${{ matrix.job.name }}/
-          cat debian/control.tpl | sed 's/{{ ARCH }}/${{ matrix.job.debian_platform }}/' > debian-build/${{ matrix.job.name }}/debian/control
-          cd debian-build/${{ matrix.job.name }}/
+          chmod -v a+x artifacts/debian-build/${{ matrix.job.name }}/bin/*
+          cp -vr debian systemd artifacts/debian-build/${{ matrix.job.name }}/
+          cat debian/control.tpl | sed 's/{{ ARCH }}/${{ matrix.job.debian_platform }}/' > artifacts/debian-build/${{ matrix.job.name }}/debian/control
+          cd artifacts/debian-build/${{ matrix.job.name }}/
           debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
 
       - name: Create Release
@@ -597,6 +596,6 @@ jobs:
         with:
           draft: true
           files: |
-            debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
-            debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
-            debian-build/rustdesk-server-utils_*_${{ matrix.job.debian_platform }}.deb
+            artifacts/debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
+            artifacts/debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
+            artifacts/debian-build/rustdesk-server-utils_*_${{ matrix.job.debian_platform }}.deb

@@ -10,7 +10,7 @@
 #
 #   debuild -uc -us
 #
-# in the directory  target/rustdesk-server
+# in the directory  artifacts/target/rustdesk-server
 #
 # The instructions are written in bash syntax,
 #
@@ -22,8 +22,8 @@
 # Make sure the submodules are present
 git submodule update --init --recursive
 
-rm -rf target/rustdesk-server  # avoid clutter from previous iteration
-mkdir -p target/rustdesk-server #  FYI: target/ is ignored by git
+rm -rf artifacts/target/rustdesk-server  # avoid clutter from previous iteration
+mkdir -p artifacts/target/rustdesk-server #  FYI: artifacts/target/ is ignored by git
 
 tar cf - \
     --exclude .git \
@@ -34,23 +34,23 @@ tar cf - \
 	debian \
 	libs rcd src \
     systemd ui \
-| ( cd target/rustdesk-server && tar x )
+| ( cd artifacts/target/rustdesk-server && tar x )
 
-mv target/rustdesk-server/debian/Makefile target/rustdesk-server/
+mv artifacts/target/rustdesk-server/debian/Makefile artifacts/target/rustdesk-server/
 
-tar cjf target/rustdesk-server-orig.tar.xz \
+tar cjf artifacts/target/rustdesk-server-orig.tar.xz \
     --strip-components=1 \
-    target/rustdesk-server
+    artifacts/target/rustdesk-server
 
 # an .orig.tar.xz tarball exists, 
 # work on the debian directory 
 
 eval $( dpkg-architecture )
 sed -e "s/{{ ARCH }}/${DEB_TARGET_ARCH}/" \
-    debian/control.tpl > target/rustdesk-server/debian/control
+    debian/control.tpl > artifacts/target/rustdesk-server/debian/control
     
 
-cd target/rustdesk-server
+cd artifacts/target/rustdesk-server
 dpkg-checkbuilddeps || echo sudo apt install dpkg-dev
 debuild -uc -us
 
