@@ -22,7 +22,7 @@ Protected mode requires an explicit public relay address in hbbs `--relay-server
 
 Private connections use an upgrade preamble on the existing TCP listeners. No additional private ports are opened. Existing WebSocket listeners remain guest entry points; owner control and tunnels require the existing TCP ports. The first version routes protected connections through the relay. The standard online-status query remains on hbbs TCP 21115.
 
-Without `ACCESS_KEY` or `--access-key`, existing behavior and ports remain unchanged.
+Without `ACCESS_KEY` or `--access-key`, private access restrictions are disabled. The signed KX v1 greeting remains available on the existing rendezvous TCP port.
 
 ## Access rules
 
@@ -45,6 +45,8 @@ The `P-` namespace is reserved for invitations. The server checks generated alia
 Validity is 1 to 1440 minutes. Expired or revoked invitations reject new admission. The owner's client validates both the alias and exact issued session UUID immediately before accepting a guest; normal password or manual approval still applies. Established sessions continue after expiration or revocation. Disconnecting or registering a new host-control connection revokes that device's previous invitations and pending grants. Existing relay bridges continue.
 
 ## Migration and online devices
+
+The rendezvous TCP listener sends a signed KX v1 greeting for RustDesk 1.5.0 API clients. Install the updated private client (1.5.1) before this server: it verifies and consumes that greeting before its independent private handshake on the same port. The relay listener keeps its existing private handshake. API tokens require the encrypted rendezvous connection; JWT is not required and API login does not grant private membership or change invitation and public-access rules.
 
 Update hbbs and hbbr together and preserve the original signing keys and peer database. The owner PCs need the modified client, including its local service, with the same **Private key** secret as `ACCESS_KEY`. The existing unmodified PCs can keep their ID server, relay and public Key settings. Their ID registration and heartbeat remain supported, and online responses combine live legacy peers with live authenticated control channels.
 

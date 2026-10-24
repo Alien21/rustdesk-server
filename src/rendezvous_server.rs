@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -51,7 +51,7 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -671,6 +671,9 @@ impl RendezvousServer {
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
+                        // Rendezvous credentials must not be forwarded to the peer over UDP.
+                        rf.token.clear();
+                        rf.switch_code.clear();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
                         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
@@ -997,7 +1000,11 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, encrypt) => {
+                        let bytes = match encrypt {
+                            Some(encrypt) => encrypt.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1323,7 +1330,7 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
-        if ws {
+        let result = if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
                 let headers = req.headers();
@@ -1359,50 +1366,80 @@ impl RendezvousServer {
                     }
                 }
             }
+            Ok(())
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
-            let first = if crate::server_access::enabled() {
-                let preface = crate::server_access::control_preamble()?;
-                framed.codec_mut().set_max_packet_length(64 * 1024);
-                let bytes = match timeout(10_000, framed.next()).await {
-                    Ok(Some(Ok(bytes))) => bytes,
-                    _ => return Ok(()),
-                };
-                drop(preface);
-                if crate::access_transport::is_upgrade(&bytes) {
-                    let parts = framed.into_parts();
-                    let mut framed = Framed::new(
-                        hbb_common::tcp::DynTcpStream(Box::new(parts.io)),
-                        parts.codec,
-                    );
-                    *framed.read_buffer_mut() = parts.read_buf;
-                    *framed.write_buffer_mut() = parts.write_buf;
-                    let upgraded = FramedStream(framed, addr, None, 0);
-                    return crate::server_access::control_connection(upgraded, addr).await;
-                }
-                framed.codec_mut().set_max_packet_length(usize::MAX);
-                Some(bytes)
+            framed.codec_mut().set_max_packet_length(64 * 1024);
+            let preface = if crate::server_access::enabled() {
+                Some(crate::server_access::control_preamble()?)
             } else {
                 None
             };
+            let mut offer = None;
+            if let Some(signing_key) = self.inner.sk.as_ref() {
+                let (exchange, greeting) = crate::rendezvous_tcp::KeyExchangeOffer::new(signing_key)?;
+                timeout(10_000, framed.send(Bytes::from(greeting.write_to_bytes()?))).await??;
+                offer = Some(exchange);
+            }
+            let first = match timeout(10_000, framed.next()).await {
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(Some(Err(err))) => return Err(err.into()),
+                _ => return Ok(()),
+            };
+            drop(preface);
+            if crate::server_access::enabled() && crate::access_transport::is_upgrade(&first) {
+                drop(offer);
+                let parts = framed.into_parts();
+                let mut framed = Framed::new(
+                    hbb_common::tcp::DynTcpStream(Box::new(parts.io)),
+                    parts.codec,
+                );
+                *framed.read_buffer_mut() = parts.read_buf;
+                *framed.write_buffer_mut() = parts.write_buf;
+                let upgraded = FramedStream(framed, addr, None, 0);
+                return crate::server_access::control_connection(upgraded, addr).await;
+            }
+            let first_message = RendezvousMessage::parse_from_bytes(&first)?;
+            let (mut encrypt, first) = match first_message.union {
+                Some(rendezvous_message::Union::KeyExchange(reply)) => {
+                    let offer = offer.ok_or_else(|| hbb_common::anyhow::anyhow!("Rendezvous signing key unavailable"))?;
+                    (Some(offer.finish(&reply)?), None)
+                }
+                _ => {
+                    drop(offer);
+                    (None, Some(first))
+                }
+            };
             let (a, mut b) = framed.split();
-            sink = Some(Sink::TcpStream(a));
-            if let Some(bytes) = first {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    return Ok(());
+            // Each half owns its own counter; the sender moves with a stashed punch sink.
+            sink = Some(Sink::TcpStream(a, encrypt.clone()));
+            async {
+                if let Some(bytes) = first {
+                    crate::rendezvous_tcp::check_message(&bytes, false)?;
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        return Ok(());
+                    }
                 }
-            }
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
+                while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                    if let Some(encrypt) = encrypt.as_mut() {
+                        if bytes.len() <= sodiumoxide::crypto::secretbox::MACBYTES {
+                            bail!("Truncated encrypted rendezvous frame");
+                        }
+                        encrypt.dec(&mut bytes)?;
+                    }
+                    crate::rendezvous_tcp::check_message(&bytes, encrypt.is_some())?;
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        break;
+                    }
                 }
-            }
-        }
+                Ok(())
+            }.await
+        };
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
         log::debug!("Tcp connection from {:?} closed", addr);
-        Ok(())
+        result
     }
 
     #[inline]
@@ -1586,6 +1623,89 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn api_relay_keeps_v1_transport_after_stashing_the_reply_sink() {
+        use sodiumoxide::crypto::{box_, secretbox};
+
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("DB_URL");
+        std::env::set_var("DB_URL", directory.path().join("peers.sqlite3"));
+        let peers = PeerMap::new().await;
+        match previous {
+            Some(previous) => std::env::set_var("DB_URL", previous),
+            None => std::env::remove_var("DB_URL"),
+        }
+        let peers = peers.unwrap();
+        let target = "934567890";
+        peers.get_or(target).await.write().await.socket_addr = "127.0.0.2:21116".parse().unwrap();
+        let (public, secret) = sign::gen_keypair();
+        let key = base64::encode(&public.0);
+        let (tx, mut notifications) = mpsc::unbounded_channel();
+        let mut server = RendezvousServer {
+            tcp_punch: Default::default(), pm: peers, tx,
+            relay_servers: Default::default(), relay_servers0: Default::default(),
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0, version: String::new(), software_url: String::new(),
+                mask: None, local_ip: String::new(), sk: Some(secret),
+            }),
+        };
+        let mut callback = server.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_key = key.clone();
+        let task = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            server.handle_listener_inner(socket, peer, &expected_key, false).await
+        });
+        let socket = TcpStream::connect(address).await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let mut client = FramedStream::from(socket, local);
+        let bytes = client.next_timeout(3000).await.unwrap().unwrap();
+        let greeting = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        let exchange = greeting.key_exchange();
+        assert_eq!(exchange.version, 1);
+        let server_public = sign::verify(&exchange.keys[0], &public).unwrap();
+        let server_public = box_::PublicKey::from_slice(&server_public).unwrap();
+        let (client_public, client_secret) = box_::gen_keypair();
+        let symmetric = secretbox::gen_key();
+        let mut reply = RendezvousMessage::new();
+        reply.set_key_exchange(KeyExchange {
+            version: 1,
+            keys: vec![client_public.0.to_vec().into(), box_::seal(
+                &symmetric.0, &box_::Nonce([0; box_::NONCEBYTES]), &server_public, &client_secret,
+            ).into()],
+            ..Default::default()
+        });
+        client.send(&reply).await.unwrap();
+        client.2 = Some(Encrypt::new_split(symmetric, true, &hbb_common::tcp::KxTranscript {
+            initiator_pk: &client_public.0, responder_pk: &server_public.0,
+            advertised: 1, picked: 1,
+        }).unwrap());
+        for uuid in ["first-request", "retry-request"] {
+            let mut request = RendezvousMessage::new();
+            request.set_request_relay(RequestRelay {
+                id: target.into(), uuid: uuid.into(), licence_key: key.clone(),
+                token: "opaque-api-token".into(), switch_code: "private-switch-code".into(),
+                ..Default::default()
+            });
+            client.send(&request).await.unwrap();
+            let notification = timeout(3000, notifications.recv()).await.unwrap().unwrap();
+            let Data::Msg(message, _) = notification else { panic!("expected relay notification") };
+            let request = message.request_relay();
+            assert_eq!(request.uuid, uuid);
+            assert!(request.token.is_empty() && request.switch_code.is_empty());
+        }
+        let mut response = RendezvousMessage::new();
+        response.set_relay_response(RelayResponse { uuid: "retry-request".into(), ..Default::default() });
+        callback.send_to_tcp_sync(response, local).await.unwrap();
+        let bytes = client.next_timeout(3000).await.unwrap().unwrap();
+        let response = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(response.relay_response().uuid, "retry-request");
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {
