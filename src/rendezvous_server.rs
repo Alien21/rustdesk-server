@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::rendezvous_tcp::Encrypt;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -16,7 +17,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{Encrypt, FramedStream},
+    tcp::FramedStream,
     timeout,
     tokio::{
         self,
@@ -1665,24 +1666,22 @@ mod tests {
         let bytes = client.next_timeout(3000).await.unwrap().unwrap();
         let greeting = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
         let exchange = greeting.key_exchange();
-        assert_eq!(exchange.version, 1);
+        assert_eq!(exchange.special_fields.unknown_fields().get(2), Some(hbb_common::protobuf::UnknownValueRef::Varint(1)));
         let server_public = sign::verify(&exchange.keys[0], &public).unwrap();
         let server_public = box_::PublicKey::from_slice(&server_public).unwrap();
         let (client_public, client_secret) = box_::gen_keypair();
         let symmetric = secretbox::gen_key();
         let mut reply = RendezvousMessage::new();
-        reply.set_key_exchange(KeyExchange {
-            version: 1,
+        let mut exchange = KeyExchange {
             keys: vec![client_public.0.to_vec().into(), box_::seal(
                 &symmetric.0, &box_::Nonce([0; box_::NONCEBYTES]), &server_public, &client_secret,
             ).into()],
             ..Default::default()
-        });
+        };
+        exchange.special_fields.mut_unknown_fields().add_varint(2, 1);
+        reply.set_key_exchange(exchange);
         client.send(&reply).await.unwrap();
-        client.2 = Some(Encrypt::new_split(symmetric, true, &hbb_common::tcp::KxTranscript {
-            initiator_pk: &client_public.0, responder_pk: &server_public.0,
-            advertised: 1, picked: 1,
-        }).unwrap());
+        let mut encrypt = Encrypt::new_split(symmetric, true, &client_public.0, &server_public.0).unwrap();
         for uuid in ["first-request", "retry-request"] {
             let mut request = RendezvousMessage::new();
             request.set_request_relay(RequestRelay {
@@ -1690,7 +1689,7 @@ mod tests {
                 token: "opaque-api-token".into(), switch_code: "private-switch-code".into(),
                 ..Default::default()
             });
-            client.send(&request).await.unwrap();
+            client.send_raw(encrypt.enc(&request.write_to_bytes().unwrap())).await.unwrap();
             let notification = timeout(3000, notifications.recv()).await.unwrap().unwrap();
             let Data::Msg(message, _) = notification else { panic!("expected relay notification") };
             let request = message.request_relay();
@@ -1700,7 +1699,8 @@ mod tests {
         let mut response = RendezvousMessage::new();
         response.set_relay_response(RelayResponse { uuid: "retry-request".into(), ..Default::default() });
         callback.send_to_tcp_sync(response, local).await.unwrap();
-        let bytes = client.next_timeout(3000).await.unwrap().unwrap();
+        let mut bytes = client.next_timeout(3000).await.unwrap().unwrap();
+        encrypt.dec(&mut bytes).unwrap();
         let response = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
         assert_eq!(response.relay_response().uuid, "retry-request");
         drop(client);
